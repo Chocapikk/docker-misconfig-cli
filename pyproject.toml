@@ -1,0 +1,22 @@
+[project]
+name = "docker-misconfig-cli"
+version = "0.1.0"
+description = "Interactive Docker CLI via socket or HTTP(S) endpoints"
+readme = "README.md"
+requires-python = ">=3.7"
+authors = [
+  { name = "Valentin Lobstein", email = "balgogan@protonmail.com" },
+]
+dependencies = [
+  "prompt_toolkit==3.0.51",
+  "rich-click==1.8.8",
+  "rich>=10.0.0",
+  "requests>=2.0.0",
+]
+
+[project.scripts]
+docker-misconfig = "docker_cli_tool:main"
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
