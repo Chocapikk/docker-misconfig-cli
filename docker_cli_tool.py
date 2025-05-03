@@ -13,7 +13,7 @@ import json
 import os
 import socket
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 import rich_click as rc
@@ -31,15 +31,11 @@ console = Console()
 
 @dataclass
 class DockerConfig:
-    """Configuration for Docker connection."""
-
     url: Optional[str] = None
     socket_path: str = "/var/run/docker.sock"
 
 
 class DockerClient:
-    """Client to interact with Docker via HTTP(S) or Unix socket."""
-
     def __init__(self, config: DockerConfig) -> None:
         self.config = config
         if config.url:
@@ -52,63 +48,74 @@ class DockerClient:
             self.socket_path = config.socket_path
             self.use_http = False
 
-    def _request(
+    def _raw_request(
         self, method: str, path: str, payload: Optional[Dict[str, Any]] = None
-    ) -> Tuple[int, str, bytes]:
-        """
-        Send request via HTTP or Unix socket and return (status, reason, body).
-        """
+    ) -> bytes:
+        """Perform the raw HTTP or Unix‐socket request and return raw body bytes."""
         if self.use_http:
-            url = f"{self.base_url}{path}"
-            try:
-                resp = requests.request(
-                    method=method,
-                    url=url,
-                    json=payload,
-                    timeout=10,
-                    verify=False,
-                )
-                return resp.status_code, resp.reason, resp.content
-            except requests.RequestException as e:
-                console.print(f"[red]HTTP request failed:[/red] {e}")
-                return 0, str(e), b""
+            resp = requests.request(
+                method, f"{self.base_url}{path}", json=payload, timeout=10, verify=False
+            )
+            return resp.status_code, resp.reason, resp.content
 
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.connect(self.socket_path)
-            header = f"{method} {path} HTTP/1.1\r\nHost: docker\r\n"
+            hdr = f"{method} {path} HTTP/1.1\r\nHost: docker\r\n"
             body = b""
             if payload is not None:
                 body = json.dumps(payload).encode()
-                header += (
-                    f"Content-Type: application/json\r\n"
-                    f"Content-Length: {len(body)}\r\n"
+                hdr += (
+                    f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
                 )
-            header += "\r\n"
-            sock.sendall(header.encode() + body)
+            hdr += "\r\n"
+            sock.sendall(hdr.encode() + body)
             sock.settimeout(1.0)
             data = bytearray()
-            try:
-                while True:
+            while True:
+                try:
                     chunk = sock.recv(4096)
                     if not chunk:
                         break
                     data.extend(chunk)
-            except socket.timeout:
-                pass
+                except socket.timeout:
+                    break
 
-        _, _, raw_body = data.partition(b"\r\n\r\n")
-        return 200, "OK", raw_body
+        # strip off headers, find first JSON bracket
+        idxs = [i for i in (data.find(b"["), data.find(b"{")) if i != -1]
+        if idxs:
+            return 200, "OK", data[min(idxs) :]
+        _, _, body = data.partition(b"\r\n\r\n")
+        return 200, "OK", body
+
+    def _call(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        expected_codes: Tuple[int, ...],
+    ) -> Optional[bytes]:
+        status, reason, body = self._raw_request(method, path, payload)
+        if status not in expected_codes:
+            console.print(f"[red]Error {method} {path}: HTTP {status} {reason}[/red]")
+            # dump body for debugging if non‐empty
+            if body.strip():
+                console.print(body.decode(errors="ignore"))
+            return None
+        return body
 
     def list_containers(self) -> List[Dict[str, Any]]:
         """Fetch and display list of containers."""
-        status, reason, content = self._request("GET", "/containers/json")
-        if status != 200:
-            console.print(f"[red]Failed to list containers {status} {reason}[/red]")
+        raw = self._call("GET", "/containers/json", None, (200,))
+        if not raw:
             return []
+
+        text = raw.decode(errors="ignore")
         try:
-            containers = json.loads(content)
-        except json.JSONDecodeError:
-            console.print("[red]Invalid JSON response[/red]")
+            decoder = json.JSONDecoder()
+            containers, _ = decoder.raw_decode(text)
+        except json.JSONDecodeError as e:
+            console.print(f"[red]JSON parse error: {e}[/red]")
+            console.print(text)
             return []
 
         table = Table(title="Docker Containers")
@@ -116,80 +123,60 @@ class DockerClient:
         table.add_column("ID", style="cyan")
         table.add_column("Names", style="green")
         for idx, ctr in enumerate(containers):
-            names = ",".join(ctr.get("Names", []))
-            table.add_row(str(idx), ctr["Id"][:12], names)
+            table.add_row(str(idx), ctr["Id"][:12], ",".join(ctr.get("Names", [])))
         console.print(table)
         return containers
 
     def exec_command(self, container_id: str, cmd: List[str]) -> None:
-        """Run a command inside container and print output."""
         exec_payload = {
             "AttachStdout": True,
             "AttachStderr": True,
             "Tty": False,
             "Cmd": cmd,
         }
-        status, reason, data = self._request(
-            "POST", f"/containers/{container_id}/exec", payload=exec_payload
+        body = self._call(
+            "POST", f"/containers/{container_id}/exec", exec_payload, (200, 201)
         )
-        if status not in (200, 201):
-            console.print(f"[red]Exec creation failed {status} {reason}[/red]")
+        if body is None:
             return
 
-        exec_id = json.loads(data).get("Id")
+        exec_id = json.loads(body).get("Id")
         start_payload = {"Detach": False, "Tty": False}
-        status, reason, output = self._request(
-            "POST", f"/exec/{exec_id}/start", payload=start_payload
-        )
-        if status not in (200, 101):
-            console.print(f"[red]Exec start failed {status} {reason}[/red]")
-            return
-
-        console.print(output.decode(errors="ignore"))
+        output = self._call("POST", f"/exec/{exec_id}/start", start_payload, (200, 101))
+        if output:
+            console.print(output.decode(errors="ignore"))
 
 
 class DockerShell:
-    """Interactive shell for Docker commands."""
-
     def __init__(
         self, client: DockerClient, history_file: str = "~/.docker_cli_history"
     ) -> None:
         self.client = client
-
-        history_path = os.path.expanduser(history_file)
-        history_dir = os.path.dirname(history_path)
-        if history_dir and not os.path.exists(history_dir):
-            os.makedirs(history_dir, exist_ok=True)
-        self.session = PromptSession(history=FileHistory(history_path))
+        path = os.path.expanduser(history_file)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.session = PromptSession(history=FileHistory(path))
 
     def run(self) -> None:
         containers = self.client.list_containers()
         if not containers:
             return
-        count = len(containers)
-        prompt = f"Select container [0-{count-1}]"
-        idx_str = self.session.prompt(f"{prompt}: ") or "0"
-        idx = int(idx_str)
-        container_id = containers[idx]["Id"][:12]
-        console.print(f"[bold]Selected:[/bold] {container_id}")
+
+        max_idx = len(containers) - 1
+        idx = int(self.session.prompt(f"Select container [0-{max_idx}]: ") or "0")
+        cid = containers[idx]["Id"][:12]
+        console.print(f"[bold]Selected:[/bold] {cid}")
 
         completer = WordCompleter(["ls", "cat", "exit", "quit"], ignore_case=True)
         while True:
-            cmd_line = self.session.prompt(f"{container_id}> ", completer=completer)
-            cmd = cmd_line.strip().split()
-            if not cmd or cmd[0] in ("exit", "quit"):
+            line = self.session.prompt(f"{cid}> ", completer=completer).strip()
+            if not line or line in ("exit", "quit"):
                 console.print("Exiting shell")
                 break
-            self.client.exec_command(container_id, cmd)
+            self.client.exec_command(cid, line.split())
 
 
 @rc.command("Docker Shell CLI with prompt history and rich output.")
-@rc.option(
-    "-u",
-    "--url",
-    "url",
-    help="Docker API endpoint e.g. http://host:2375 or https://host:2376",
-)
+@rc.option("-u", "--url", "url", help="Docker API endpoint e.g. http://host:2375")
 @rc.option(
     "-s",
     "--socket",
@@ -198,10 +185,8 @@ class DockerShell:
     help="Path to Docker Unix socket",
 )
 def main(url: Optional[str] = None, socket_path: str = "/var/run/docker.sock") -> None:
-    config = DockerConfig(url=url, socket_path=socket_path)
-    client = DockerClient(config)
-    shell = DockerShell(client)
-    shell.run()
+    cfg = DockerConfig(url=url, socket_path=socket_path)
+    DockerShell(DockerClient(cfg)).run()
 
 
 if __name__ == "__main__":
