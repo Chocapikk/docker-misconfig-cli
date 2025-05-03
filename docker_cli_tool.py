@@ -166,13 +166,23 @@ class DockerShell:
         cid = containers[idx]["Id"][:12]
         console.print(f"[bold]Selected:[/bold] {cid}")
 
-        completer = WordCompleter(["ls", "cat", "exit", "quit"], ignore_case=True)
+        commands: List[str] = ["ls", "cat", "exit", "quit"]
+        completer = WordCompleter(commands, ignore_case=True)
+
         while True:
             line = self.session.prompt(f"{cid}> ", completer=completer).strip()
-            if not line or line in ("exit", "quit"):
+            if line in ("exit", "quit"):
                 console.print("Exiting shell")
                 break
-            self.client.exec_command(cid, line.split())
+
+            parts = line.split()
+            self.client.exec_command(cid, parts)
+
+            root = parts[0]
+            if root not in commands:
+                commands.append(root)
+                completer = WordCompleter(commands, ignore_case=True)
+                self.session.completer = completer
 
 
 @rc.command("Docker Shell CLI with prompt history and rich output.")
