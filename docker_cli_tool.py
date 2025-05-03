@@ -13,7 +13,7 @@ import json
 import os
 import socket
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import rich_click as rc
@@ -80,7 +80,6 @@ class DockerClient:
                 except socket.timeout:
                     break
 
-        # strip off headers, find first JSON bracket
         idxs = [i for i in (data.find(b"["), data.find(b"{")) if i != -1]
         if idxs:
             return 200, "OK", data[min(idxs) :]
@@ -97,7 +96,6 @@ class DockerClient:
         status, reason, body = self._raw_request(method, path, payload)
         if status not in expected_codes:
             console.print(f"[red]Error {method} {path}: HTTP {status} {reason}[/red]")
-            # dump body for debugging if non‐empty
             if body.strip():
                 console.print(body.decode(errors="ignore"))
             return None
@@ -186,17 +184,34 @@ class DockerShell:
 
 
 @rc.command("Docker Shell CLI with prompt history and rich output.")
-@rc.option("-u", "--url", "url", help="Docker API endpoint e.g. http://host:2375")
 @rc.option(
-    "-s",
-    "--socket",
-    "socket_path",
-    default="/var/run/docker.sock",
-    help="Path to Docker Unix socket",
+    "-u",
+    "--url",
+    default=None,
+    help="Docker API endpoint e.g. http://host:2375 or https://host:2376",
 )
-def main(url: Optional[str] = None, socket_path: str = "/var/run/docker.sock") -> None:
-    cfg = DockerConfig(url=url, socket_path=socket_path)
-    DockerShell(DockerClient(cfg)).run()
+@rc.option(
+    "-s", "--socket", "socket_path", default=None, help="Path to Docker Unix socket"
+)
+def main(
+    url: Optional[str] = None,
+    socket_path: Optional[str] = None,
+) -> None:
+    if (url is None and socket_path is None) or (
+        url is not None and socket_path is not None
+    ):
+        raise rc.UsageError("Must specify exactly one of --url or --socket")
+
+    if url:
+        console.print(f"[green]Using HTTP API at[/green] {url}")
+        cfg = DockerConfig(url=url, socket_path="")
+    else:
+        path = socket_path
+        console.print(f"[green]Using Unix socket at[/green] {path}")
+        cfg = DockerConfig(url=None, socket_path=path)
+
+    client = DockerClient(cfg)
+    DockerShell(client).run()
 
 
 if __name__ == "__main__":
